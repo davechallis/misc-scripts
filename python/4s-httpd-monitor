@@ -1,0 +1,170 @@
+#!/usr/bin/python
+
+# Runs a daemon which watches 4store httpd processes for high load/memory
+# usage.
+#
+# Memory/cpu limits are configurable, are the email addresses which get
+# notified when a 4s-httpd process is killed.
+#
+# To run as a daemon, make this script executable and run:
+# ./4s-httpd-monitor
+#
+# To stop the monitor, just kill the process (killall 4s-httpd-monitor on
+# linux boxes should work).
+#
+# Requires the psutil and daemon libraries.
+
+
+# Copyright (C) 2011 Dave Challis
+
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+
+
+import sys
+import time
+import psutil
+import daemon
+import smtplib
+import traceback
+from datetime import datetime
+from email.mime.text import MIMEText
+
+# Global config options
+PROCNAME = '4s-httpd' # Process name to watch for
+MEM_LIMIT = 3000      # memory usage limit in megabytes
+CPU_LIMIT = 70        # % cpu utilisation limit
+TIME_LIMIT = 40       # number of seconds before killing process
+INTERVAL = 10         # in seconds, how often cpu/mem checks are run
+
+# Email settings
+MAIL_FROM = '4s-httpd-monitor@hostname'
+MAIL_TO = ['user@example.org']
+
+# Whether or not to start this script as a daemon
+DAEMONISE = True
+
+# Stores PIDs that have been flagged (i.e. due to high mem/cpu use)
+FLAGGED = {}
+
+
+# Flag a process ID as being problematic
+def flag(pid):
+    if FLAGGED.has_key(pid):
+        FLAGGED[pid] += INTERVAL
+    else:
+        FLAGGED[pid] = INTERVAL
+
+
+# Clear any warning flags on a process
+def unflag(pid):
+    if FLAGGED.has_key(pid):
+        del FLAGGED[pid]
+
+
+# Check if a process ID has previously been flagged for problems
+def problem_flagged(pid):
+    if FLAGGED.has_key(pid) and FLAGGED[pid] > TIME_LIMIT:
+        return True
+    return False
+
+
+# Send an email to notification list
+def mail_users(subject, text):
+    msg = MIMEText(text)
+    msg['Subject'] = '[4s-httpd-monitor] ' + subject
+    msg['From'] = MAIL_FROM
+    msg['To'] = ', '.join(MAIL_TO)
+    s = smtplib.SMTP('localhost')
+    s.sendmail(MAIL_FROM, MAIL_TO, msg.as_string())
+    s.quit()
+
+
+# Get current date time in ISO format (YYYY-MM-DD HH:MM:SS)
+def get_timestamp():
+    return datetime.now().isoformat(' ').split('.')[0]
+
+# Send SIGTERM to a process, email notification list about it
+def terminate_proc(proc, info):
+    # Email users about event
+    subject = '4s-httpd process killed'
+    now = get_timestamp()
+    msg = """
+4s-httpd with PID %s killed at %s with:
+CPU: %s
+Mem: %sMb (rss) / %sMb (vms)
+
+""" % (proc.pid, now, info['cpu'], info['mem_rss_mb'], info['mem_vms_mb'])
+    mail_users(subject, msg)
+
+    # Send SIGTERM to 4s-httpd process
+    proc.terminate()
+
+    # Reset warnings on this PID
+    unflag(proc.pid)
+
+
+def monitor_processes():
+    for proc in psutil.process_iter():
+        if proc.name == PROCNAME:
+            # get % cpu usage
+            cpu = proc.get_cpu_percent(0.1)
+
+            # get memory usage in Mb
+            (mem_rss, mem_vms) = proc.get_memory_info()
+            mem_rss_mb = mem_rss / (1024*1024)
+            mem_vms_mb = mem_vms / (1024*1024)
+
+            # Criteria for flagging a process
+            if mem_rss_mb > MEM_LIMIT \
+            or mem_vms_mb > MEM_LIMIT \
+            or cpu > CPU_LIMIT:
+                flag(proc.pid)
+            else:
+                unflag(proc.pid)
+
+            # If problem is found, send SIGTERM to process
+            if problem_flagged(proc.pid):
+                info = {
+                'cpu': cpu,
+                    'mem_rss_mb': mem_rss_mb,
+                    'mem_vms_mb': mem_vms_mb
+                }
+                terminate_proc(proc, info)
+
+
+def main():
+    while True:
+        # Check 4s-httpd processes for excess CPU/MEM usage
+        try:
+            monitor_processes()
+        except (IOError, psutil.NoSuchProcess), e:
+            # Process no longer there, so unflag
+            unflag(e.pid)
+        except Exception, e:
+            subject = 'Exception in monitor script'
+            msg = """
+An exception occurred in the 4s-httpd-monitoring script at %s:
+
+%s
+""" % (get_timestamp(), traceback.format_exc())
+            mail_users(subject, msg)
+
+        # sleep for INTERVAL seconds then check processes again
+        time.sleep(INTERVAL)
+
+
+# Start this script as a daemon
+if __name__ == '__main__':
+    if DAEMONISE:
+        with daemon.DaemonContext():
+            main()
+    else:
+        main()
